@@ -1,7 +1,7 @@
 {
   "name": "xlsx2csv-service",
-  "version": "1.0.0",
-  "description": "Minimal XLSX -> CSV REST converter",
+  "version": "1.1.0",
+  "description": "Minimal XLSX/XLS -> CSV REST converter with fallbacks",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
