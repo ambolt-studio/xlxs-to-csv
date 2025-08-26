@@ -1,85 +1,84 @@
-// server.js
+// server.js — conversión genérica XLSX/XLS → CSV “tabular” sin perder filas ni headers
 const express = require('express');
 const XLSX = require('xlsx');
-const fs = require('fs');
-const path = require('path');
-const { execFile } = require('child_process');
 
 const app = express();
 const MAX_MB = parseInt(process.env.MAX_PAYLOAD_MB || '20', 10);
 app.use(express.json({ limit: `${MAX_MB}mb` }));
 
-// ───────────── utils ─────────────
-function decodeBase64Data(str) {
-  if (!str || typeof str !== 'string') throw new Error('Missing base64 data');
-  const b64 = str.replace(/^data:.*?;base64,/, '');
-  return Buffer.from(b64, 'base64');
-}
-function coerceSheetParam(sheet) {
-  if (typeof sheet === 'string' && /^\d+$/.test(sheet.trim())) return parseInt(sheet.trim(), 10);
-  return sheet;
-}
-function pickSheet(wb, sheetParam) {
-  const sheet = coerceSheetParam(sheetParam);
-  if (typeof sheet === 'number') {
-    const idx = Math.max(1, Math.floor(sheet)) - 1;
-    const name = wb.SheetNames[idx];
-    if (!name) throw new Error(`Sheet index ${sheet} not found. Available: ${wb.SheetNames.join(', ')}`);
-    return wb.Sheets[name];
-  }
-  if (typeof sheet === 'string') {
-    const ws = wb.Sheets[sheet];
-    if (!ws) throw new Error(`Sheet "${sheet}" not found. Available: ${wb.SheetNames.join(', ')}`);
-    return ws;
-  }
-  return wb.Sheets[wb.SheetNames[0]];
-}
-function whichSoffice() {
-  return new Promise((resolve) => { execFile('soffice', ['--version'], (err) => resolve(!err)); });
+// ───────── utils ─────────
+function b64buf(s) {
+  if (typeof s !== 'string') throw new Error('data must be base64 string');
+  const clean = s.replace(/^data:.*?;base64,/, '');
+  return Buffer.from(clean, 'base64');
 }
 
-// CSV safe-escape
+// CSV escape (RFC-4180)
 function esc(v) {
-  if (v === null || v === undefined) return '';
+  if (v === null || v === undefined) v = '';
   const s = String(v);
-  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  return (s.includes('"') || s.includes('\n') || s.includes('\r') || s.includes(',') || s.includes(';') || s.includes('\t'))
+    ? `"${s.replace(/"/g, '""')}"`
+    : s;
 }
 
-// Busca automáticamente la fila de headers: prioridad a una que contenga "date"
-function findHeaderRow(aoa) {
-  if (!Array.isArray(aoa)) return -1;
-  let bestIdx = -1, bestScore = -1;
-  for (let i = 0; i < aoa.length; i++) {
-    const row = aoa[i] || [];
-    const nonEmpty = row.filter(c => (c !== null && c !== undefined && String(c).trim() !== '')).length;
-    const hasDate = row.some(c => String(c).trim().toLowerCase() === 'date');
-    const score = (hasDate ? 100 : 0) + nonEmpty; // favorece “date” y densidad
-    if (score > bestScore) { bestScore = score; bestIdx = i; }
-    if (hasDate && nonEmpty >= 3) return i; // match “fuerte”
+// date → ISO (YYYY-MM-DD o YYYY-MM-DD HH:MM:SS)
+function dateToISO(d) {
+  if (!(d instanceof Date) || isNaN(d)) return '';
+  const pad = n => String(n).padStart(2,'0');
+  const y = d.getFullYear(), m = pad(d.getMonth()+1), day = pad(d.getDate());
+  const hh = pad(d.getHours()), mm = pad(d.getMinutes()), ss = pad(d.getSeconds());
+  // si no hay parte horaria, solo fecha
+  return (d.getHours()===0 && d.getMinutes()===0 && d.getSeconds()===0)
+    ? `${y}-${m}-${day}`
+    : `${y}-${m}-${day} ${hh}:${mm}:${ss}`;
+}
+
+// renderiza celda SIN separadores de miles, respetando tipos
+function cellToString(cell) {
+  if (!cell || cell.v === undefined || cell.v === null) return '';
+  switch (cell.t) {
+    case 'd': return dateToISO(cell.v);            // ya es Date si usamos cellDates:true
+    case 'n': return Number.isFinite(cell.v) ? String(cell.v) : String(cell.v ?? ''); // 50000.12, sin “,” de miles
+    case 'b': return cell.v ? 'TRUE' : 'FALSE';
+    default:  return String(cell.v);
   }
-  return bestIdx;
 }
 
-// ───────────── endpoints ─────────────
+// expande merges opcionalmente copiando el valor del topleft
+function buildMergeFillMap(ws) {
+  const map = new Map();
+  const merges = ws['!merges'] || [];
+  for (const m of merges) {
+    const { s, e } = m; // start/end {r,c}
+    const topLeft = XLSX.utils.encode_cell(s);
+    for (let r = s.r; r <= e.r; r++) {
+      for (let c = s.c; c <= e.c; c++) {
+        const addr = XLSX.utils.encode_cell({ r, c });
+        if (addr !== topLeft) map.set(addr, topLeft);
+      }
+    }
+  }
+  return map;
+}
+
+// ───────── endpoints ─────────
 app.get('/healthz', (_req, res) => res.status(200).send('ok'));
 
-// Debug: lista hojas + preview de primeras filas
+// lista hojas + preview (debug)
 app.post('/sheets', (req, res) => {
   try {
-    const { data } = req.body || {};
-    if (!data) return res.status(400).json({ error: 'Missing "data" (base64 XLSX)' });
-    const buf = decodeBase64Data(data);
+    const buf = b64buf(req.body?.data);
     const wb = XLSX.read(buf, { type: 'buffer', cellDates: true });
-
-    const sheets = wb.SheetNames.map((name) => {
-      const ws = wb.Sheets[name];
+    const sheets = wb.SheetNames.map(n => {
+      const ws = wb.Sheets[n];
       const ref = ws['!ref'] || null;
-      const sample = XLSX.utils.sheet_to_json(ws, { header: 1, raw: false, defval: '', blankrows: false }).slice(0, 5);
-      return { name, ref, sample };
+      const sample = XLSX.utils.sheet_to_json(ws, { header: 1, raw: true, defval: '' }).slice(0, 5);
+      return { name: n, ref, sample };
     });
     res.json({ sheets });
   } catch (e) {
-    res.status(500).json({ error: 'sheets_failed', detail: String(e?.message || e) });
+    res.status(400).json({ error: String(e?.message || e) });
   }
 });
 
@@ -87,134 +86,77 @@ app.post('/sheets', (req, res) => {
  * POST /convert
  * Body:
  * {
- *   data: "<BASE64 XLSX/XLS>",
- *   sheet: 1 | "brex cta",                 // opcional
- *   delimiter: "," | ";",                  // opcional (default ",")
- *   response: "base64" | "text",           // opcional (default "base64")
- *   header_row: number | "auto",           // opcional (default "auto")
- *   skip_regex: "^(Vendor Name)",          // opcional (default salta Vendor Name)
- *   raw: true|false,                       // opcional (default true)  -> números sin miles
- *   force_quotes: true|false               // opcional (default true)  -> todo entre comillas
+ *   "data": "<BASE64 XLSX/XLS>",   // requerido
+ *   "sheet": 1 | "Hoja",           // opcional (1-based o nombre). default: 1ra hoja
+ *   "delimiter": ",",              // opcional: "," ";" "\t"  (default: ",")
+ *   "force_quotes": false,         // opcional: si true, comilla siempre
+ *   "fill_merges": false,          // opcional: si true, replica valor del topleft sobre celdas merged
+ *   "response": "base64"|"text"    // opcional (default: "base64")
  * }
  */
-app.post('/convert', async (req, res) => {
+app.post('/convert', (req, res) => {
   try {
-    let {
-      data, sheet, delimiter, response,
-      header_row, skip_regex, raw, force_quotes,
-    } = req.body || {};
-    if (!data || typeof data !== 'string') {
-      return res.status(400).json({ error: 'Missing "data" (base64 XLSX) in request body' });
-    }
-    sheet = coerceSheetParam(sheet);
+    const body = req.body || {};
+    const buf  = b64buf(body.data);
+    const wb   = XLSX.read(buf, { type: 'buffer', cellDates: true });
 
-    // defaults robustos para bancos
-    const FS = (typeof delimiter === 'string' && delimiter.length) ? delimiter : ',';
-    raw = (typeof raw === 'boolean') ? raw : true;
-    force_quotes = (typeof force_quotes === 'boolean') ? force_quotes : true;
-    const skipRe = new RegExp(skip_regex || '^(Vendor Name)', 'i');
-
-    const buf = decodeBase64Data(data);
-    const wb = XLSX.read(buf, { type: 'buffer', cellDates: true });
-    const ws = pickSheet(wb, sheet);
-
-    // AOA con defval para conservar vacíos
-    const aoa = XLSX.utils.sheet_to_json(ws, {
-      header: 1, raw, defval: '', blankrows: false,
-    });
-
-    if (!Array.isArray(aoa) || !aoa.length) {
-      const emptyCsv = '';
-      if ((response || 'base64') === 'text') {
-        res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-        return res.status(200).send(emptyCsv);
-      }
-      return res.status(200).json({ mime_type: 'text/csv', data: Buffer.from(emptyCsv, 'utf8').toString('base64') });
-    }
-
-    // Detectar header row
-    let hr;
-    if (typeof header_row === 'number') {
-      hr = Math.max(1, Math.floor(header_row)) - 1;
+    // hoja
+    let ws;
+    if (typeof body.sheet === 'number') {
+      const idx = Math.max(1, Math.floor(body.sheet)) - 1;
+      const name = wb.SheetNames[idx];
+      if (!name) return res.status(400).json({ error: `Sheet index ${body.sheet} not found. Available: ${wb.SheetNames.join(', ')}` });
+      ws = wb.Sheets[name];
+    } else if (typeof body.sheet === 'string' && body.sheet.trim() !== '') {
+      ws = wb.Sheets[body.sheet];
+      if (!ws) return res.status(400).json({ error: `Sheet "${body.sheet}" not found. Available: ${wb.SheetNames.join(', ')}` });
     } else {
-      hr = findHeaderRow(aoa);
+      ws = wb.Sheets[wb.SheetNames[0]];
     }
-    const headersRaw = (aoa[hr] || []).map(h => String(h || '').trim());
-    // Normalizar headers vacíos
-    const headers = headersRaw.map((h, i) => h || `col_${i+1}`);
 
-    // Filtrar filas de datos a partir de hr+1
-    const dataRows = aoa.slice(hr + 1).filter(row => {
-      const first = String((row[0] ?? '')).trim();
-      const allEmpty = row.every(c => (String(c || '').trim() === ''));
-      if (allEmpty) return false;
-      if (skipRe.test(first)) return false; // e.g., "Vendor Name : …"
-      return true;
-    });
+    // rango usado exacto
+    const ref = ws['!ref'];
+    if (!ref) {
+      const empty = '';
+      return (body.response === 'text')
+        ? res.type('text/csv').send(empty)
+        : res.json({ mime_type: 'text/csv', data: Buffer.from(empty, 'utf8').toString('base64') });
+    }
+    const range = XLSX.utils.decode_range(ref);
 
-    // Alinear ancho y construir CSV con headers
-    let csv = headers.map(esc).join(FS) + '\n' +
-      dataRows.map(r => headers.map((_, i) => esc(r[i] ?? '')).join(FS)).join('\n');
+    // opcional: relleno de merges
+    const mergeMap = body.fill_merges ? buildMergeFillMap(ws) : new Map();
 
-    // Fallback LibreOffice si quedó vacío y está habilitado
-    if ((!csv || !csv.trim()) && String(process.env.USE_LIBREOFFICE || '') === '1') {
-      const hasLO = await whichSoffice();
-      if (hasLO) {
-        // Generamos un libro con solo las filas útiles
-        const ws2 = XLSX.utils.aoa_to_sheet([headers, ...dataRows]);
-        const csvLO = await new Promise((resolve) => {
-          const tmpDir = '/tmp';
-          const stamp = Date.now() + '_' + Math.random().toString(36).slice(2);
-          const inX = path.join(tmpDir, `in_${stamp}.xlsx`);
-          const outCsv = path.join(tmpDir, `in_${stamp}.csv`);
-          const wb2 = XLSX.utils.book_new();
-          XLSX.utils.book_append_sheet(wb2, ws2, 'Sheet1');
-          const buf2 = XLSX.write(wb2, { type: 'buffer', bookType: 'xlsx' });
-          fs.writeFileSync(inX, buf2);
-          execFile(
-            'soffice',
-            ['--headless', '--convert-to', 'csv:"Text - txt - csv (StarCalc)":44,34,0', '--outdir', tmpDir, inX],
-            () => {
-              try {
-                const text = fs.existsSync(outCsv) ? fs.readFileSync(outCsv, 'utf8') : '';
-                fs.unlinkSync(inX); fs.unlinkSync(outCsv);
-                resolve(text);
-              } catch { resolve(''); }
-            }
-          );
-        });
-        if (csvLO && csvLO.trim()) csv = csvLO;
+    // recorremos celda por celda para asegurar ancho constante y sin pérdidas
+    const rows = [];
+    for (let R = range.s.r; R <= range.e.r; R++) {
+      const row = [];
+      for (let C = range.s.c; C <= range.e.c; C++) {
+        const addr = XLSX.utils.encode_cell({ r: R, c: C });
+        const src  = mergeMap.get(addr) || addr;
+        const cell = ws[src];
+        row.push(cellToString(cell));
       }
+      rows.push(row);
     }
 
-    // Forzar comillas si se pidió
-    if (force_quotes) {
-      // Ya escapamos con esc(), que pone comillas si hace falta.
-      // Para “forzar”, envolvemos todo de nuevo si no tiene comillas.
-      const lines = csv.split('\n').map(line => {
-        if (!line) return line;
-        const cols = line.split(FS).map(c => {
-          if (!/^".*"$/.test(c)) return `"${c.replace(/^"|"$/g, '')}"`;
-          return c;
-        });
-        return cols.join(FS);
-      });
-      csv = lines.join('\n');
-    }
+    // delimitador
+    const FS = (typeof body.delimiter === 'string' && body.delimiter.length) ? body.delimiter : ',';
 
-    if ((response || 'base64') === 'text') {
-      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-      return res.status(200).send(csv);
-    }
-    return res.status(200).json({ mime_type: 'text/csv', data: Buffer.from(csv, 'utf8').toString('base64') });
+    // a CSV
+    const lines = rows.map(r => r.map(v => body.force_quotes ? `"${String(v).replace(/"/g,'""')}"` : esc(v)).join(FS));
+    const csv = lines.join('\n');
 
-  } catch (err) {
-    console.error(err);
-    return res.status(500).json({ error: 'conversion_failed', detail: String(err?.message || err) });
+    if (body.response === 'text') {
+      res.type('text/csv; charset=utf-8').send(csv);
+    } else {
+      res.json({ mime_type: 'text/csv', data: Buffer.from(csv, 'utf8').toString('base64') });
+    }
+  } catch (e) {
+    res.status(400).json({ error: String(e?.message || e) });
   }
 });
 
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => {
-  console.log(`xlsx2csv service listening on :${PORT}`);
-});
+app.listen(PORT, () => console.log('xlsx2csv listening on :' + PORT));
+
