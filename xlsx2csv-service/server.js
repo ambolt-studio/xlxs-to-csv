@@ -1,106 +1,12 @@
-// server.js — conversión genérica XLSX/XLS → CSV “tabular” sin perder filas ni headers
-const express = require('express');
-const XLSX = require('xlsx');
-
-const app = express();
-const MAX_MB = parseInt(process.env.MAX_PAYLOAD_MB || '20', 10);
-app.use(express.json({ limit: `${MAX_MB}mb` }));
-
-// ───────── utils ─────────
-function b64buf(s) {
-  if (typeof s !== 'string') throw new Error('data must be base64 string');
-  const clean = s.replace(/^data:.*?;base64,/, '');
-  return Buffer.from(clean, 'base64');
-}
-
-// CSV escape (RFC-4180)
-function esc(v) {
-  if (v === null || v === undefined) v = '';
-  const s = String(v);
-  return (s.includes('"') || s.includes('\n') || s.includes('\r') || s.includes(',') || s.includes(';') || s.includes('\t'))
-    ? `"${s.replace(/"/g, '""')}"`
-    : s;
-}
-
-// date → ISO (YYYY-MM-DD o YYYY-MM-DD HH:MM:SS)
-function dateToISO(d) {
-  if (!(d instanceof Date) || isNaN(d)) return '';
-  const pad = n => String(n).padStart(2,'0');
-  const y = d.getFullYear(), m = pad(d.getMonth()+1), day = pad(d.getDate());
-  const hh = pad(d.getHours()), mm = pad(d.getMinutes()), ss = pad(d.getSeconds());
-  // si no hay parte horaria, solo fecha
-  return (d.getHours()===0 && d.getMinutes()===0 && d.getSeconds()===0)
-    ? `${y}-${m}-${day}`
-    : `${y}-${m}-${day} ${hh}:${mm}:${ss}`;
-}
-
-// renderiza celda SIN separadores de miles, respetando tipos
-function cellToString(cell) {
-  if (!cell || cell.v === undefined || cell.v === null) return '';
-  switch (cell.t) {
-    case 'd': return dateToISO(cell.v);            // ya es Date si usamos cellDates:true
-    case 'n': return Number.isFinite(cell.v) ? String(cell.v) : String(cell.v ?? ''); // 50000.12, sin “,” de miles
-    case 'b': return cell.v ? 'TRUE' : 'FALSE';
-    default:  return String(cell.v);
-  }
-}
-
-// expande merges opcionalmente copiando el valor del topleft
-function buildMergeFillMap(ws) {
-  const map = new Map();
-  const merges = ws['!merges'] || [];
-  for (const m of merges) {
-    const { s, e } = m; // start/end {r,c}
-    const topLeft = XLSX.utils.encode_cell(s);
-    for (let r = s.r; r <= e.r; r++) {
-      for (let c = s.c; c <= e.c; c++) {
-        const addr = XLSX.utils.encode_cell({ r, c });
-        if (addr !== topLeft) map.set(addr, topLeft);
-      }
-    }
-  }
-  return map;
-}
-
-// ───────── endpoints ─────────
-app.get('/healthz', (_req, res) => res.status(200).send('ok'));
-
-// lista hojas + preview (debug)
-app.post('/sheets', (req, res) => {
-  try {
-    const buf = b64buf(req.body?.data);
-    const wb = XLSX.read(buf, { type: 'buffer', cellDates: true });
-    const sheets = wb.SheetNames.map(n => {
-      const ws = wb.Sheets[n];
-      const ref = ws['!ref'] || null;
-      const sample = XLSX.utils.sheet_to_json(ws, { header: 1, raw: true, defval: '' }).slice(0, 5);
-      return { name: n, ref, sample };
-    });
-    res.json({ sheets });
-  } catch (e) {
-    res.status(400).json({ error: String(e?.message || e) });
-  }
-});
-
-/**
- * POST /convert
- * Body:
- * {
- *   "data": "<BASE64 XLSX/XLS>",   // requerido
- *   "sheet": 1 | "Hoja",           // opcional (1-based o nombre). default: 1ra hoja
- *   "delimiter": ",",              // opcional: "," ";" "\t"  (default: ",")
- *   "force_quotes": false,         // opcional: si true, comilla siempre
- *   "fill_merges": false,          // opcional: si true, replica valor del topleft sobre celdas merged
- *   "response": "base64"|"text"    // opcional (default: "base64")
- * }
- */
 app.post('/convert', (req, res) => {
   try {
     const body = req.body || {};
-    const buf  = b64buf(body.data);
-    const wb   = XLSX.read(buf, { type: 'buffer', cellDates: true });
+    const buf  = Buffer.from(String(body.data || '').replace(/^data:.*?;base64,/, ''), 'base64');
+    if (!buf.length) return res.status(400).json({ error: 'Missing "data" (base64 XLSX)' });
 
-    // hoja
+    const wb = XLSX.read(buf, { type: 'buffer', cellDates: true });
+
+    // Selección de hoja (número 1-based o nombre)
     let ws;
     if (typeof body.sheet === 'number') {
       const idx = Math.max(1, Math.floor(body.sheet)) - 1;
@@ -114,49 +20,86 @@ app.post('/convert', (req, res) => {
       ws = wb.Sheets[wb.SheetNames[0]];
     }
 
-    // rango usado exacto
     const ref = ws['!ref'];
     if (!ref) {
       const empty = '';
       return (body.response === 'text')
-        ? res.type('text/csv').send(empty)
+        ? res.type('text/csv; charset=utf-8').send(empty)
         : res.json({ mime_type: 'text/csv', data: Buffer.from(empty, 'utf8').toString('base64') });
     }
-    const range = XLSX.utils.decode_range(ref);
 
-    // opcional: relleno de merges
-    const mergeMap = body.fill_merges ? buildMergeFillMap(ws) : new Map();
-
-    // recorremos celda por celda para asegurar ancho constante y sin pérdidas
-    const rows = [];
-    for (let R = range.s.r; R <= range.e.r; R++) {
-      const row = [];
-      for (let C = range.s.c; C <= range.e.c; C++) {
-        const addr = XLSX.utils.encode_cell({ r: R, c: C });
-        const src  = mergeMap.get(addr) || addr;
-        const cell = ws[src];
-        row.push(cellToString(cell));
-      }
-      rows.push(row);
+    // ---------- 1) Leemos TODAS las celdas como AOA (crudo, sin miles) ----------
+    const aoaFull = XLSX.utils.sheet_to_json(ws, {
+      header: 1, raw: true, defval: '', blankrows: false,
+    });
+    if (!aoaFull.length) {
+      const empty = '';
+      return (body.response === 'text')
+        ? res.type('text/csv; charset=utf-8').send(empty)
+        : res.json({ mime_type: 'text/csv', data: Buffer.from(empty, 'utf8').toString('base64') });
     }
 
-    // delimitador
+    // ---------- 2) Detectamos fila de header y límites de la tabla ----------
+    // Estrategia: elegir la fila con mayor cantidad de celdas no vacías
+    // dentro de las primeras N filas (heights habituales). Luego tomamos
+    // el primer y último índice no vacío de ESA fila como ancho de la tabla.
+    const SCAN_ROWS = Math.min(50, aoaFull.length);
+    let headerRow = 0, bestCount = -1;
+    for (let r = 0; r < SCAN_ROWS; r++) {
+      const row = aoaFull[r] || [];
+      const count = row.reduce((acc, v) => acc + (String(v).trim() !== '' ? 1 : 0), 0);
+      if (count > bestCount) { bestCount = count; headerRow = r; }
+    }
+    const hdr = aoaFull[headerRow] || [];
+    let left = 0;
+    while (left < hdr.length && String(hdr[left]).trim() === '') left++;
+    let right = hdr.length - 1;
+    while (right >= 0 && String(hdr[right]).trim() === '') right--;
+
+    if (right < left) {
+      // No pudimos definir ancho: devolvemos todo sin normalizar
+      left = 0; right = (aoaFull[0] || []).length - 1;
+    }
+
+    // ---------- 3) Cortamos por ese sub-rango y dejamos headers + datos ----------
+    const sliceRow = (row) => {
+      const out = [];
+      for (let c = left; c <= right; c++) out.push(row[c] ?? '');
+      return out;
+    };
+    const headers = sliceRow(hdr).map(x => {
+      const s = String(x || '').trim();
+      return s || ''; // si querés, podés poner col_1, col_2…
+    });
+
+    const table = [headers];
+    for (let r = headerRow + 1; r < aoaFull.length; r++) {
+      table.push(sliceRow(aoaFull[r] || []));
+    }
+
+    // ---------- 4) Serializamos CSV RFC-4180 ----------
     const FS = (typeof body.delimiter === 'string' && body.delimiter.length) ? body.delimiter : ',';
+    const forceQuotes = body.force_quotes === true;
 
-    // a CSV
-    const lines = rows.map(r => r.map(v => body.force_quotes ? `"${String(v).replace(/"/g,'""')}"` : esc(v)).join(FS));
-    const csv = lines.join('\n');
+    const esc = (v) => {
+      if (v === null || v === undefined) v = '';
+      // Normalizamos números: sin separador de miles (ya viene crudo de XLSX)
+      // Fechas: si XLSX las interpretó como Date, sheet_to_json(raw:true) trae serial; pero
+      // esta AOA conserva string renderizado. Si querés ISO estricto, convertí antes.
+      const s = String(v);
+      const needs = forceQuotes || /[",\n\r\t;]/.test(s);
+      return needs ? `"${s.replace(/"/g, '""')}"` : s;
+    };
 
+    const csv = table.map(row => row.map(esc).join(FS)).join('\n');
+
+    // ---------- 5) Respuesta ----------
     if (body.response === 'text') {
-      res.type('text/csv; charset=utf-8').send(csv);
-    } else {
-      res.json({ mime_type: 'text/csv', data: Buffer.from(csv, 'utf8').toString('base64') });
+      return res.type('text/csv; charset=utf-8').send(csv);
     }
+    return res.json({ mime_type: 'text/csv', data: Buffer.from(csv, 'utf8').toString('base64') });
+
   } catch (e) {
-    res.status(400).json({ error: String(e?.message || e) });
+    return res.status(400).json({ error: String(e?.message || e) });
   }
 });
-
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log('xlsx2csv listening on :' + PORT));
-
