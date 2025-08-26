@@ -6,132 +6,64 @@ const path = require('path');
 const { execFile } = require('child_process');
 
 const app = express();
-
-// Max payload en MB (default: 20). Podés ajustar con MAX_PAYLOAD_MB
 const MAX_MB = parseInt(process.env.MAX_PAYLOAD_MB || '20', 10);
 app.use(express.json({ limit: `${MAX_MB}mb` }));
 
-// ───────────────────────── utils ─────────────────────────
+// ───────────── utils ─────────────
 function decodeBase64Data(str) {
   if (!str || typeof str !== 'string') throw new Error('Missing base64 data');
   const b64 = str.replace(/^data:.*?;base64,/, '');
   return Buffer.from(b64, 'base64');
 }
-
 function coerceSheetParam(sheet) {
-  // "1" -> 1 (1-based). Si es string no-numérico, se devuelve tal cual.
-  if (typeof sheet === 'string' && /^\d+$/.test(sheet.trim())) {
-    return parseInt(sheet.trim(), 10);
-  }
+  if (typeof sheet === 'string' && /^\d+$/.test(sheet.trim())) return parseInt(sheet.trim(), 10);
   return sheet;
 }
-
 function pickSheet(wb, sheetParam) {
   const sheet = coerceSheetParam(sheetParam);
-  let ws;
   if (typeof sheet === 'number') {
-    const idx = Math.max(1, Math.floor(sheet)) - 1; // 1-based → 0-based
+    const idx = Math.max(1, Math.floor(sheet)) - 1;
     const name = wb.SheetNames[idx];
-    if (!name) {
-      throw new Error(`Sheet index ${sheet} not found. Available: ${wb.SheetNames.join(', ')}`);
-    }
-    ws = wb.Sheets[name];
-  } else if (typeof sheet === 'string') {
-    ws = wb.Sheets[sheet];
-    if (!ws) {
-      throw new Error(`Sheet "${sheet}" not found. Available: ${wb.SheetNames.join(', ')}`);
-    }
-  } else {
-    ws = wb.Sheets[wb.SheetNames[0]]; // primera hoja
+    if (!name) throw new Error(`Sheet index ${sheet} not found. Available: ${wb.SheetNames.join(', ')}`);
+    return wb.Sheets[name];
   }
-  return ws;
+  if (typeof sheet === 'string') {
+    const ws = wb.Sheets[sheet];
+    if (!ws) throw new Error(`Sheet "${sheet}" not found. Available: ${wb.SheetNames.join(', ')}`);
+    return ws;
+  }
+  return wb.Sheets[wb.SheetNames[0]];
 }
-
-function csvFromSheet_XLSX(ws, FS) {
-  // Intento 1: conversión directa
-  return XLSX.utils.sheet_to_csv(ws, {
-    FS,          // separador de campos
-    RS: '\n',    // separador de filas
-    strip: true,
-    blankrows: false,
-    raw: false,  // usa valores “mostrados” (cuidado con fechas si querés raw)
-    defval: '',  // conserva vacíos
-  });
-}
-
-function csvFromSheet_AOA(ws, FS) {
-  // Intento 2: AOA → CSV manual (rescata contenido cuando !ref está raro)
-  const aoa = XLSX.utils.sheet_to_json(ws, {
-    header: 1,
-    raw: false,
-    defval: '',
-    blankrows: false,
-  });
-  if (!Array.isArray(aoa) || !aoa.length) return '';
-
-  const esc = (v) => {
-    if (v === null || v === undefined) return '';
-    const s = String(v);
-    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-  };
-  return aoa.map(row => row.map(esc).join(FS)).join('\n');
-}
-
 function whichSoffice() {
-  return new Promise((resolve) => {
-    execFile('soffice', ['--version'], (err) => resolve(!err));
-  });
+  return new Promise((resolve) => { execFile('soffice', ['--version'], (err) => resolve(!err)); });
 }
 
-async function csvFromSheet_LibreOffice(ws, FS) {
-  // Intento 3 (opcional): usar LibreOffice para evaluar fórmulas
-  // Estrategia: creamos un workbook de 1 hoja con 'ws' y lo convertimos.
-  const tmpDir = '/tmp';
-  const stamp = Date.now() + '_' + Math.random().toString(36).slice(2);
-  const inX = path.join(tmpDir, `in_${stamp}.xlsx`);
-  const outCsv = path.join(tmpDir, `in_${stamp}.csv`);
+// CSV safe-escape
+function esc(v) {
+  if (v === null || v === undefined) return '';
+  const s = String(v);
+  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
 
-  const wb1 = XLSX.utils.book_new();
-  // Usamos nombre seguro 'Sheet1' para evitar caracteres problemáticos
-  XLSX.utils.book_append_sheet(wb1, ws, 'Sheet1');
-  const buf1 = XLSX.write(wb1, { type: 'buffer', bookType: 'xlsx' });
-  fs.writeFileSync(inX, buf1);
-
-  try {
-    // Forzamos separador coma con filtro CSV de LO (44 = ',', 34 = '"', 0 = UTF-8)
-    // Ver doc: "Text - txt - csv (StarCalc)"
-    await new Promise((resolve, reject) => {
-      execFile(
-        'soffice',
-        [
-          '--headless',
-          '--convert-to',
-          'csv:"Text - txt - csv (StarCalc)":44,34,0',
-          '--outdir',
-          tmpDir,
-          inX,
-        ],
-        (err) => (err ? reject(err) : resolve())
-      );
-    });
-    if (fs.existsSync(outCsv)) {
-      return fs.readFileSync(outCsv, 'utf8');
-    }
-    // Fallback: algunos LO generan nombre por defecto
-    const alt = path.join(tmpDir, path.basename(inX, '.xlsx') + '.csv');
-    return fs.existsSync(alt) ? fs.readFileSync(alt, 'utf8') : '';
-  } finally {
-    // Limpieza best-effort
-    try { fs.unlinkSync(inX); } catch {}
-    try { fs.unlinkSync(outCsv); } catch {}
+// Busca automáticamente la fila de headers: prioridad a una que contenga "date"
+function findHeaderRow(aoa) {
+  if (!Array.isArray(aoa)) return -1;
+  let bestIdx = -1, bestScore = -1;
+  for (let i = 0; i < aoa.length; i++) {
+    const row = aoa[i] || [];
+    const nonEmpty = row.filter(c => (c !== null && c !== undefined && String(c).trim() !== '')).length;
+    const hasDate = row.some(c => String(c).trim().toLowerCase() === 'date');
+    const score = (hasDate ? 100 : 0) + nonEmpty; // favorece “date” y densidad
+    if (score > bestScore) { bestScore = score; bestIdx = i; }
+    if (hasDate && nonEmpty >= 3) return i; // match “fuerte”
   }
+  return bestIdx;
 }
 
-// ───────────────────────── endpoints ─────────────────────────
-
+// ───────────── endpoints ─────────────
 app.get('/healthz', (_req, res) => res.status(200).send('ok'));
 
-// Debug: lista hojas y muestra sample de primeras filas
+// Debug: lista hojas + preview de primeras filas
 app.post('/sheets', (req, res) => {
   try {
     const { data } = req.body || {};
@@ -142,9 +74,7 @@ app.post('/sheets', (req, res) => {
     const sheets = wb.SheetNames.map((name) => {
       const ws = wb.Sheets[name];
       const ref = ws['!ref'] || null;
-      const sample = XLSX.utils.sheet_to_json(ws, {
-        header: 1, raw: false, defval: '', blankrows: false,
-      }).slice(0, 5);
+      const sample = XLSX.utils.sheet_to_json(ws, { header: 1, raw: false, defval: '', blankrows: false }).slice(0, 5);
       return { name, ref, sample };
     });
     res.json({ sheets });
@@ -153,51 +83,131 @@ app.post('/sheets', (req, res) => {
   }
 });
 
-// Conversión XLSX/XLS → CSV
+/**
+ * POST /convert
+ * Body:
+ * {
+ *   data: "<BASE64 XLSX/XLS>",
+ *   sheet: 1 | "brex cta",                 // opcional
+ *   delimiter: "," | ";",                  // opcional (default ",")
+ *   response: "base64" | "text",           // opcional (default "base64")
+ *   header_row: number | "auto",           // opcional (default "auto")
+ *   skip_regex: "^(Vendor Name)",          // opcional (default salta Vendor Name)
+ *   raw: true|false,                       // opcional (default true)  -> números sin miles
+ *   force_quotes: true|false               // opcional (default true)  -> todo entre comillas
+ * }
+ */
 app.post('/convert', async (req, res) => {
   try {
-    let { data, sheet, delimiter, response } = req.body || {};
+    let {
+      data, sheet, delimiter, response,
+      header_row, skip_regex, raw, force_quotes,
+    } = req.body || {};
     if (!data || typeof data !== 'string') {
       return res.status(400).json({ error: 'Missing "data" (base64 XLSX) in request body' });
     }
-    // Normalizamos sheet (acepta "2" → 2)
     sheet = coerceSheetParam(sheet);
+
+    // defaults robustos para bancos
+    const FS = (typeof delimiter === 'string' && delimiter.length) ? delimiter : ',';
+    raw = (typeof raw === 'boolean') ? raw : true;
+    force_quotes = (typeof force_quotes === 'boolean') ? force_quotes : true;
+    const skipRe = new RegExp(skip_regex || '^(Vendor Name)', 'i');
 
     const buf = decodeBase64Data(data);
     const wb = XLSX.read(buf, { type: 'buffer', cellDates: true });
-
     const ws = pickSheet(wb, sheet);
-    const FS = (typeof delimiter === 'string' && delimiter.length) ? delimiter : ',';
 
-    // 1) XLSX → CSV nativo
-    let csv = csvFromSheet_XLSX(ws, FS);
+    // AOA con defval para conservar vacíos
+    const aoa = XLSX.utils.sheet_to_json(ws, {
+      header: 1, raw, defval: '', blankrows: false,
+    });
 
-    // 2) Fallback AOA si quedó vacío/blanco
-    if (!csv || !csv.trim()) {
-      csv = csvFromSheet_AOA(ws, FS);
+    if (!Array.isArray(aoa) || !aoa.length) {
+      const emptyCsv = '';
+      if ((response || 'base64') === 'text') {
+        res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+        return res.status(200).send(emptyCsv);
+      }
+      return res.status(200).json({ mime_type: 'text/csv', data: Buffer.from(emptyCsv, 'utf8').toString('base64') });
     }
 
-    // 3) Fallback LibreOffice (opcional, si está habilitado y disponible)
+    // Detectar header row
+    let hr;
+    if (typeof header_row === 'number') {
+      hr = Math.max(1, Math.floor(header_row)) - 1;
+    } else {
+      hr = findHeaderRow(aoa);
+    }
+    const headersRaw = (aoa[hr] || []).map(h => String(h || '').trim());
+    // Normalizar headers vacíos
+    const headers = headersRaw.map((h, i) => h || `col_${i+1}`);
+
+    // Filtrar filas de datos a partir de hr+1
+    const dataRows = aoa.slice(hr + 1).filter(row => {
+      const first = String((row[0] ?? '')).trim();
+      const allEmpty = row.every(c => (String(c || '').trim() === ''));
+      if (allEmpty) return false;
+      if (skipRe.test(first)) return false; // e.g., "Vendor Name : …"
+      return true;
+    });
+
+    // Alinear ancho y construir CSV con headers
+    let csv = headers.map(esc).join(FS) + '\n' +
+      dataRows.map(r => headers.map((_, i) => esc(r[i] ?? '')).join(FS)).join('\n');
+
+    // Fallback LibreOffice si quedó vacío y está habilitado
     if ((!csv || !csv.trim()) && String(process.env.USE_LIBREOFFICE || '') === '1') {
       const hasLO = await whichSoffice();
       if (hasLO) {
-        try {
-          csv = await csvFromSheet_LibreOffice(ws, FS);
-        } catch (e) {
-          // seguimos sin romper si falla LO
-          console.error('LibreOffice fallback failed:', e?.message || e);
-        }
+        // Generamos un libro con solo las filas útiles
+        const ws2 = XLSX.utils.aoa_to_sheet([headers, ...dataRows]);
+        const csvLO = await new Promise((resolve) => {
+          const tmpDir = '/tmp';
+          const stamp = Date.now() + '_' + Math.random().toString(36).slice(2);
+          const inX = path.join(tmpDir, `in_${stamp}.xlsx`);
+          const outCsv = path.join(tmpDir, `in_${stamp}.csv`);
+          const wb2 = XLSX.utils.book_new();
+          XLSX.utils.book_append_sheet(wb2, ws2, 'Sheet1');
+          const buf2 = XLSX.write(wb2, { type: 'buffer', bookType: 'xlsx' });
+          fs.writeFileSync(inX, buf2);
+          execFile(
+            'soffice',
+            ['--headless', '--convert-to', 'csv:"Text - txt - csv (StarCalc)":44,34,0', '--outdir', tmpDir, inX],
+            () => {
+              try {
+                const text = fs.existsSync(outCsv) ? fs.readFileSync(outCsv, 'utf8') : '';
+                fs.unlinkSync(inX); fs.unlinkSync(outCsv);
+                resolve(text);
+              } catch { resolve(''); }
+            }
+          );
+        });
+        if (csvLO && csvLO.trim()) csv = csvLO;
       }
     }
 
-    // Respuesta
+    // Forzar comillas si se pidió
+    if (force_quotes) {
+      // Ya escapamos con esc(), que pone comillas si hace falta.
+      // Para “forzar”, envolvemos todo de nuevo si no tiene comillas.
+      const lines = csv.split('\n').map(line => {
+        if (!line) return line;
+        const cols = line.split(FS).map(c => {
+          if (!/^".*"$/.test(c)) return `"${c.replace(/^"|"$/g, '')}"`;
+          return c;
+        });
+        return cols.join(FS);
+      });
+      csv = lines.join('\n');
+    }
+
     if ((response || 'base64') === 'text') {
       res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-      return res.status(200).send(csv || '');
-    } else {
-      const csvB64 = Buffer.from(csv || '', 'utf8').toString('base64');
-      return res.status(200).json({ mime_type: 'text/csv', data: csvB64 });
+      return res.status(200).send(csv);
     }
+    return res.status(200).json({ mime_type: 'text/csv', data: Buffer.from(csv, 'utf8').toString('base64') });
+
   } catch (err) {
     console.error(err);
     return res.status(500).json({ error: 'conversion_failed', detail: String(err?.message || err) });
